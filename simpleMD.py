@@ -1,15 +1,9 @@
 ## Main functions for this repository
 ## SimpleMD class with modifications for angular potential and refinement with SAXS data on-the-fly
 
-
 import numpy as np
 import re
 import numba
-# import tempfile
-# import sys
-# import matplotlib.pyplot as plt
-# import scipy.optimize as opt
-# import pickle
 from collections import deque
 
 try:
