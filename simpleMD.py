@@ -341,7 +341,10 @@ def _compute_forces(cell, positions, forcecutoff, neighbors, point, forces, k_fe
 
     return engconf
 
-def _update_parameters(istep, tstep, temperature, SAXS, exp_SAXS, sigma_SAXS, lambda_SAXS, fm, eta_lambda0, tau_lambda, eta_theta0, tau_theta, engint,alpha,beta):
+def _update_parameters(istep, tstep, temperature, SAXS, exp_SAXS, sigma_SAXS, lambda_SAXS, fm, eta_lambda0, tau_lambda,
+                       eta_theta0, tau_theta, engint, alpha, beta):
+    """ Input variables `alpha` and `beta` are the hyperparameters for the regularization of ensemble refinement and
+    forward-model refinement"""
 
     
     
@@ -350,17 +353,17 @@ def _update_parameters(istep, tstep, temperature, SAXS, exp_SAXS, sigma_SAXS, la
 
     engint+=temperature*np.dot(lambda_SAXS , fm_SAXS)
 
-    #gradients
+    # gradients
     grad_lambda = exp_SAXS - fm_SAXS + alpha * (sigma_SAXS**2) * lambda_SAXS
-    grad_a = alpha*np.dot(lambda_SAXS , SAXS)+beta/fm[0]
-    grad_b = alpha*np.sum(lambda_SAXS) 
+    grad_a = alpha*np.dot(lambda_SAXS, SAXS) + beta/fm[0]
+    grad_b = alpha*np.sum(lambda_SAXS)
 
-    #learning rates
+    # learning rates
     eta_lambda = eta_lambda0 / (1 + istep / tau_lambda)
     eta_theta = eta_theta0 / (1 + istep / tau_theta)
     
 
-    #update
+    # update
     lambda_SAXS -= eta_lambda * grad_lambda * tstep 
     fm[0] -= eta_theta[0] * grad_a * tstep
     if fm[0]<0:
@@ -372,52 +375,51 @@ def _update_parameters(istep, tstep, temperature, SAXS, exp_SAXS, sigma_SAXS, la
 
     return engint
 
-def _update_ff(istep, tstep, temperature, SAXS, exp_SAXS, sigma_SAXS, cov, var, angle, k_angle, eta_ff0, tau_ff, engint,beta):
+def _update_ff(istep, tstep, temperature, SAXS, exp_SAXS, sigma_SAXS, cov, var, angle, k_angle, eta_ff0, tau_ff, engint,
+               beta):
     
-    
-    engint+=k_angle*np.sum(np.cos(angle))
+    engint += k_angle*np.sum(np.cos(angle))
 
     eta_ff = eta_ff0 / (1 + istep / tau_ff)
-    grad=(-1/temperature)*np.dot(cov,(SAXS-exp_SAXS)/(sigma_SAXS**2))+(beta/(temperature**2))*k_angle*var
-    k_angle-=eta_ff * grad * tstep
+    grad = -(1/temperature)*np.dot(cov, (SAXS - exp_SAXS)/sigma_SAXS**2) + beta/(temperature**2)*k_angle*var
+    k_angle -= eta_ff * grad * tstep
 
-    engint-=k_angle*np.sum(np.cos(angle))
+    engint -= k_angle*np.sum(np.cos(angle))
 
     return k_angle, engint
 
-def _update_full(istep, tstep, temperature, SAXS, exp_SAXS, sigma_SAXS, lambda_SAXS, fm, k_l, tau_l, k_fm, tau_fm, mean_ff, var_ff, angle, k_angle, k_ff, tau_ff,engint,delay,alpha,beta,gamma):
-    
-    
-    
+def _update_full(istep, tstep, temperature, SAXS, exp_SAXS, sigma_SAXS, lambda_SAXS, fm, k_l, tau_l, k_fm, tau_fm,
+                 mean_ff, var_ff, angle, k_angle, k_ff, tau_ff, engint, delay, alpha, beta, gamma):
 
-    fm_SAXS = fm[0] * SAXS + fm[1] 
+    fm_SAXS = fm[0] * SAXS + fm[1]
 
-    engint+=temperature*np.dot(lambda_SAXS , fm_SAXS) +k_angle*np.sum(np.cos(angle))
+    engint += temperature*np.dot(lambda_SAXS, fm_SAXS) + k_angle*np.sum(np.cos(angle))
 
-    #gradients
+    # gradients
     if istep > delay:
-        grad_ff= alpha* (1/temperature)*(np.sum(np.cos(angle))-mean_ff)+beta*(1/(temperature**2))*k_angle*var_ff
+        grad_ff = (alpha/temperature)*(np.sum(np.cos(angle)) - mean_ff) + (beta/temperature**2)*k_angle*var_ff
     else:
-        grad_ff=0.0
+        grad_ff = 0.0
+    
     grad_l = exp_SAXS - fm_SAXS + alpha * (sigma_SAXS**2) * lambda_SAXS
-    grad_a = alpha*np.dot(lambda_SAXS , SAXS)+gamma/fm[0]
+    grad_a = alpha*np.dot(lambda_SAXS, SAXS) + gamma/fm[0]
     grad_b = alpha*np.sum(lambda_SAXS) 
 
-    #learning rates
+    # learning rates
     eta_l = k_l / (1 + istep / tau_l)
     eta_fm = k_fm / (1 + istep / tau_fm)
     eta_ff= k_ff / (1 + istep / tau_ff)
 
-    #update
+    # update
     lambda_SAXS -= eta_l * grad_l * tstep 
-    k_angle-= eta_ff*grad_ff* tstep
+    k_angle -= eta_ff*grad_ff* tstep
     fm[0] -= eta_fm[0] * grad_a * tstep
-    if fm[0]<0:
-        fm[0]=-fm[0]
+    if fm[0] < 0:
+        fm[0] = -fm[0]
     fm[1] -= eta_fm[1] * grad_b * tstep
 
     fm_SAXS = fm[0] * SAXS + fm[1] 
-    engint-=temperature*np.dot(lambda_SAXS , fm_SAXS)+k_angle*np.sum(np.cos(angle))
+    engint -= temperature*np.dot(lambda_SAXS, fm_SAXS) + k_angle*np.sum(np.cos(angle))
 
     return k_angle, engint
 
@@ -874,12 +876,12 @@ class SimpleMD:
                     average=True
                 self.SAXS+=fm_SAXS[0]*SAXS+fm_SAXS[1]
 
-            if istep>self.nequilib and istep<=self.nequilib+self.nonthefly:
+            if (istep > self.nequilib) and (istep <= self.nequilib + self.nonthefly):
                 if self.exp_rgyr2 is not None:
-                    coef_rgyr2=self.k_rgyr2/(1+istep/(self.tau_rgyr2))
-                    error_rgyr2=-0.5*self.alpha_rgyr2*self.l_rgyr2*self.sigma_rgyr2**2
-                    self.l_rgyr2-= coef_rgyr2*self.tstep*(self.exp_rgyr2-rgyr2-error_rgyr2)
-                    l_rgyr2_avg+=self.l_rgyr2
+                    coef_rgyr2 = self.k_rgyr2/(1 + istep/self.tau_rgyr2)
+                    error_rgyr2 = -0.5*self.alpha_rgyr2*self.l_rgyr2*self.sigma_rgyr2**2
+                    self.l_rgyr2 -= coef_rgyr2*self.tstep*(self.exp_rgyr2 - rgyr2 - error_rgyr2)
+                    l_rgyr2_avg += self.l_rgyr2
 
                 if self.exp_SAXS is not None:
                     if self.k_SAXS==0 or self.eta_ff0==0:
@@ -910,7 +912,7 @@ class SimpleMD:
                 self.write_statistics(istep+1,self.tstep,len(self.positions),engkin,engconf,engint,rgyr2,self.l_rgyr2,self.k_angle,mean_ff, logw[0])
                 self.write_otf((istep+1)//self.nstat,self.l_SAXS,SAXS,fm_SAXS)
                 if self.exp_SAXS is not None:
-                    alpha=1.0
+                    ## alpha=1.0  # ??
                     grad_lambda = self.exp_SAXS - (fm_SAXS[0]*SAXS+fm_SAXS[1]) + self.alpha * (self.sigma_SAXS**2) * self.l_SAXS
                     self.grad_lambda[:,(istep+1)//self.nstat-1]=grad_lambda
                 self.write_angle((istep+1)//self.nstat,self.positions,self.cell)
