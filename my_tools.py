@@ -34,7 +34,8 @@ def _compute_rgyr2(positions, cell):
     return rgyr2
 
 @numba.njit(cache=True, fastmath=True)
-def _compute_SAXS(positions, cell, q_SAXS, a_SAXS, b_SAXS, c_SAXS):
+def _compute_SAXS(positions, cell, q_SAXS, a_SAXS = [0.0, 0.0, 0.0, 0.0], b_SAXS = [0.0, 0.0, 0.0, 0.0], c_SAXS = 1.0):
+    """ a_SAXS, b_SAXS, c_SAXS are used to compute the scattering factor (by default, `scattering = 1`) """
 
     saxs = np.zeros(len(q_SAXS))
 
@@ -61,6 +62,10 @@ def _compute_SAXS(positions, cell, q_SAXS, a_SAXS, b_SAXS, c_SAXS):
 
         saxs[q] = saxs[q]*scattering2
 
+    return saxs
+
+def compute_SAXS(positions, cell, q_SAXS, a_SAXS = [0.0, 0.0, 0.0, 0.0], b_SAXS = [0.0, 0.0, 0.0, 0.0], c_SAXS = 1.0):
+    saxs = _compute_SAXS(positions, cell, q_SAXS, a_SAXS, b_SAXS, c_SAXS)
     return saxs
 
 @numba.njit(cache=True, fastmath=True)
