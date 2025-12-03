@@ -72,7 +72,10 @@ def _compute_rgyr2(positions: np.ndarray, cell: np.ndarray = None, is_forces: bo
 def _compute_SAXS(positions: np.ndarray, cell: np.ndarray = None, q_SAXS: np.ndarray = 0.1*(np.arange(10) + 1),
                   a_SAXS: np.ndarray = np.zeros(4), b_SAXS: np.ndarray = np.zeros(4), c_SAXS: float = 1.0,
                   is_forces: bool = False):
-    """ Low-level backend that employs `numba`. See `compute_SAXS` for documentation. """
+    """ 
+    Low-level backend that employs `numba`. See `compute_SAXS` for documentation.
+    Additional parameter: `is_forces` (if True, return also forces, None otherwise).
+    """
 
     saxs = np.zeros(len(q_SAXS))
     if is_forces:
@@ -124,8 +127,7 @@ def _compute_SAXS(positions: np.ndarray, cell: np.ndarray = None, q_SAXS: np.nda
     return saxs, forces  # numba requires same output (no two different outputs depending on is_force)
 
 def compute_SAXS(positions: np.ndarray, cell: np.ndarray = None, q_SAXS: np.ndarray = 0.1*(np.arange(10) + 1),
-                 a_SAXS: np.ndarray = np.zeros(4), b_SAXS: np.ndarray = np.zeros(4), c_SAXS: float = 1.0,
-                 is_forces: bool = False):
+                 a_SAXS: np.ndarray = np.zeros(4), b_SAXS: np.ndarray = np.zeros(4), c_SAXS: float = 1.0):
     """
     Compute the SAXS spectrum through the Debye equation.
     
@@ -156,10 +158,10 @@ def compute_SAXS(positions: np.ndarray, cell: np.ndarray = None, q_SAXS: np.ndar
 
     Notes
     -----
-    This is a wrapper for `_compute_SAXS`, in this way I do not need to import numba in the notebook to run `compute_SAXS`,
-    clearly numba has to be imported anyway in the module.
+    This is a wrapper for `_compute_SAXS` that returns SAXS spectrum only (not forces), in this way I do not need to
+    import numba in the notebook to run `compute_SAXS`, clearly numba has to be imported anyway in the module.
     """
-    saxs = _compute_SAXS(positions, cell, q_SAXS, a_SAXS, b_SAXS, c_SAXS, is_forces)[0]
+    saxs = _compute_SAXS(positions, cell, q_SAXS, a_SAXS, b_SAXS, c_SAXS, False)[0]
     return saxs
 
 @numba.njit(cache=True, fastmath=True)
@@ -219,7 +221,7 @@ def compare_dicts(dict1, dict2):
 
     return
 
-def compute_dkl(p, p0, if_zero = False):
+def compute_dkl(p, p0, if_zero=False):
     """
     Compute the Kullback-Leibler divergence between `p` and `p0`.
     If `if_zero` is True, then remove from `p` and `p0` the points with `p0 = 0` so that no `inf` value

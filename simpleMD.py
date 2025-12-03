@@ -159,7 +159,7 @@ def _compute_angle(positions, cell, is_forces: bool = False):
         cos = dot / (r1 * r2)
 
         cos_array[i] = cos
-        angles[i] =np.arccos(cos)
+        angles[i] = np.arccos(cos)
 
         if is_forces:
             # Force on i
@@ -192,7 +192,7 @@ def _compute_angle(positions, cell, is_forces: bool = False):
     if not is_forces: forces = None
     return angles, cos_array, forces
 
-@numba.njit(cache=True,fastmath=True)
+@numba.njit(cache=True, fastmath=True)
 def _compute_forces(cell, positions, forcecutoff, neighbors, point, forces, k_fene, maxbond, k_angle, l_rgyr2, q_SAXS,
                     l_SAXS, a_SAXS, b_SAXS, c_SAXS, fm):
     """
@@ -211,7 +211,8 @@ def _compute_forces(cell, positions, forcecutoff, neighbors, point, forces, k_fe
         (`forcecutoff` is float, `neighbors` and `point` are list variables).
 
     forces: array-like
-        Starting values of the forces (same shape as `positions`).
+        Starting values of the forces (same shape as `positions`). This variable is modified in place:
+        the function does not return it, still its new value persists after the function returns.
     
     k_fene, maxbond: float
         Variables required to compute the FENE interactions.
@@ -228,7 +229,8 @@ def _compute_forces(cell, positions, forcecutoff, neighbors, point, forces, k_fe
 
     Notes
     -----
-    It makes usage of `_compute_rgyr2` and `_compute_saxs` to compute the squared gyration radius and the SAXS spectrum,
+    It makes usage of `_compute_angle` to compute the angular potential and corresponding forces. Also, it makes usage
+    of `_compute_rgyr2` and `_compute_saxs` to compute the squared gyration radius and the SAXS spectrum,
     which are interactions included in the potential energy due to the refinement on-the-fly; these two functions also
     compute the corresponding forces (derivatives with respect to the atomic coordinates). This will make the code cleaner,
     since new functions can be included for further terms.
@@ -319,6 +321,7 @@ def _compute_forces(cell, positions, forcecutoff, neighbors, point, forces, k_fe
     
     return engconf
 
+@numba.njit(cache=True, fastmath=True)
 def _update_parameters(istep, tstep, temperature, SAXS, exp_SAXS, sigma_SAXS, lambda_SAXS, fm, eta_lambda0, tau_lambda,
                        eta_theta0, tau_theta, engint, alpha, beta):
     """
@@ -349,6 +352,11 @@ def _update_parameters(istep, tstep, temperature, SAXS, exp_SAXS, sigma_SAXS, la
     
     alpha, beta: float
         The hyperparameters for the regularization of ensemble refinement and forward-model refinement.
+
+    Notes
+    -----
+    The input variables `lambda_SAXS` and `fm` are arrays modified in place: the function does not return them, still
+    their new values persist after the function returns.
     """
 
     fm_SAXS = fm[0] * SAXS + fm[1]
@@ -376,8 +384,13 @@ def _update_parameters(istep, tstep, temperature, SAXS, exp_SAXS, sigma_SAXS, la
 
     return engint
 
-def _update_ff(istep, tstep, temperature, SAXS, exp_SAXS, sigma_SAXS, cov, var, angle, k_angle, eta_ff0, tau_ff, engint,
-               beta):
+@numba.njit(cache=True, fastmath=True)
+def _update_ff(istep, tstep, temperature, SAXS, exp_SAXS, sigma_SAXS, cov, var, angle, k_angle, eta_ff0, tau_ff,
+               engint, beta):
+    """
+    Update the `k_angle` coefficient in case of force-field refinement with angular correction.
+    Also, recompute the interaction energy with the updated coefficient `k_angle`.
+    """
     
     engint += k_angle*np.sum(np.cos(angle))
 
@@ -389,12 +402,27 @@ def _update_ff(istep, tstep, temperature, SAXS, exp_SAXS, sigma_SAXS, cov, var, 
 
     return k_angle, engint
 
+@numba.njit(cache=True, fastmath=True)
 def _update_full(istep, tstep, temperature, SAXS, exp_SAXS, sigma_SAXS, lambda_SAXS, fm, k_l, tau_l, k_fm, tau_fm,
                  mean_ff, var_ff, angle, k_angle, k_ff, tau_ff, engint, delay, alpha, beta, gamma):
+    """
+    Update parameters in the case of simultaneous refinement on the ensemble and the force field.
 
-    fm_SAXS = fm[0] * SAXS + fm[1]
+    Notes
+    -----
+    The input variables `lambda_SAXS` and `fm` are arrays modified in place: the function does not return them, still
+    their new values persist after the function returns.
 
-    engint += temperature*np.dot(lambda_SAXS, fm_SAXS) + k_angle*np.sum(np.cos(angle))
+    This function runs two parts: one is the same as `_update_parameters` (refinement of ensemble and forward model),
+    the second one is similar to `_update_ff` but computes the gradient differently, because of the combination of
+    force-field fitting with the refinements of ensemble and forward model, while `_update_ff` acts when there is
+    force-field fitting only.
+    """
+
+    engint = _update_parameters(istep, tstep, temperature, SAXS, exp_SAXS, sigma_SAXS, lambda_SAXS, fm, k_l, tau_l,
+                                k_fm, tau_fm, engint, alpha, gamma)
+
+    engint += k_angle*np.sum(np.cos(angle))
 
     # gradients
     if istep > delay:
@@ -402,47 +430,34 @@ def _update_full(istep, tstep, temperature, SAXS, exp_SAXS, sigma_SAXS, lambda_S
     else:
         grad_ff = 0.0
     
-    grad_l = exp_SAXS - fm_SAXS + alpha * (sigma_SAXS**2) * lambda_SAXS
-    grad_a = alpha*np.dot(lambda_SAXS, SAXS) + gamma/fm[0]
-    grad_b = alpha*np.sum(lambda_SAXS) 
-
     # learning rates
-    eta_l = k_l / (1 + istep / tau_l)
-    eta_fm = k_fm / (1 + istep / tau_fm)
-    eta_ff= k_ff / (1 + istep / tau_ff)
+    eta_ff = k_ff / (1 + istep / tau_ff)
 
     # update
-    lambda_SAXS -= eta_l * grad_l * tstep 
     k_angle -= eta_ff*grad_ff* tstep
-    fm[0] -= eta_fm[0] * grad_a * tstep
-    if fm[0] < 0:
-        fm[0] = -fm[0]
-    fm[1] -= eta_fm[1] * grad_b * tstep
-
-    fm_SAXS = fm[0] * SAXS + fm[1] 
-    engint -= temperature*np.dot(lambda_SAXS, fm_SAXS) + k_angle*np.sum(np.cos(angle))
+    engint -= k_angle*np.sum(np.cos(angle))
 
     return k_angle, engint
 
 @numba.njit(cache=True, fastmath=True)
-def _compute_list(cell,positions,listcutoff,nlist,point):
-   listcutoff2=listcutoff**2
-   point[0]=0
-   for i in range(len(positions)):
-       point[i+1]=point[i]
-       for j in range(i+1,len(positions)):
-            distancex=positions[i,0]-positions[j,0]
-            distancey=positions[i,1]-positions[j,1]
-            distancez=positions[i,2]-positions[j,2]
-            distancex-=np.floor(distancex/cell[0]+0.5)*cell[0]
-            distancey-=np.floor(distancey/cell[1]+0.5)*cell[1]
-            distancez-=np.floor(distancez/cell[2]+0.5)*cell[2]
-            distance2=distancex**2+distancey**2+distancez**2
-            if distance2 <= listcutoff2:
-                if point[i+1]>=len(nlist):
-                    raise Exception("Verlet list size exceeded\nIncrease maxneighbours")
-                nlist[point[i+1]]=j
-                point[i+1]+=1
+def _compute_list(cell, positions, listcutoff, nlist, point):
+    listcutoff2 = listcutoff**2
+    point[0] = 0
+    for i in range(len(positions)):
+        point[i + 1] = point[i]
+        for j in range(i + 1, len(positions)):
+                distancex = positions[i,0]-positions[j,0]
+                distancey = positions[i,1]-positions[j,1]
+                distancez = positions[i,2]-positions[j,2]
+                distancex -= np.floor(distancex/cell[0]+0.5)*cell[0]
+                distancey -= np.floor(distancey/cell[1]+0.5)*cell[1]
+                distancez -= np.floor(distancez/cell[2]+0.5)*cell[2]
+                distance2 = distancex**2+distancey**2+distancez**2
+                if distance2 <= listcutoff2:
+                    if point[i + 1] >= len(nlist):
+                        raise Exception("Verlet list size exceeded\nIncrease maxneighbours")
+                    nlist[point[i + 1]] = j
+                    point[i + 1] += 1
 
 def generate_lattice(n=1, a0=1.6796):
     """ Generate the lattice. """
@@ -519,7 +534,7 @@ def read_positions(file):
     assert(len(positions)==natoms)
     return np.array(cell),np.array(positions)
 
-def write_trajectory(file,trajectory,*,wrapatoms=False):
+def write_trajectory(file, trajectory, *, wrapatoms=False):
     with open(file,"w") as f:
         for cell,positions in trajectory:
             print("%d" % len(positions), file=f)
@@ -558,10 +573,12 @@ class SimpleMD:
                 beta=1.0,
                 gamma=1.0,
                 sigma_SAXS=None,
+                fm_SAXS_0 = np.array([1.0, 0.0]),
                 k_fm=[0.0,0.0],
                 tau_fm=1.0,
                 k_ff=0.0,
                 tau_ff=1.0,
+                window_M=10000,
                 listcutoff=3.0,
                 nstep=1,
                 nconfig=10,
@@ -624,6 +641,13 @@ class SimpleMD:
         else:
             self.sigma_SAXS=np.array(sigma_SAXS)
         self.k_fm=np.array(k_fm)
+        
+        self.fm_SAXS_0 = fm_SAXS_0
+        """ Starting values of the coefficients for the forward model of SAXS spectrum. """
+
+        self.window_M = window_M
+        """ Width of the window used to estimate average and variance for on-the-fly refinement. """
+
         self.tau_fm=tau_fm
         self.eta_ff0=k_ff
         self.tau_ff=tau_ff
@@ -695,7 +719,7 @@ class SimpleMD:
         engint -= 0.5*np.sum(masses*np.sum(velocities**2, axis=1))
         return velocities, engint
 
-    def write_positions(self,cell,positions,wrapatoms=False):
+    def write_positions(self, cell, positions, wrapatoms=False):
         if self.trajfile:
             mode="w"
             if self.write_positions_first:
@@ -715,7 +739,7 @@ class SimpleMD:
                positions = pbc(cell, positions)
             self.trajectory.append((cell, +positions))
 
-    def write_final_positions(self,cell,positions,wrapatoms=False):
+    def write_final_positions(self, cell, positions, wrapatoms=False):
         if self.outputfile:
             with open(self.outputfile,"w") as f:
                 print("%d" % len(positions), file=f)
@@ -743,77 +767,72 @@ class SimpleMD:
             self.statistics.append((istep, istep*tstep, 2.0*engkin/(3.0*natoms), engconf, engkin + engconf,
                                     engkin + engconf + engint, rgyr2, l_rgyr2, k_angle, mean_w, mean_ff))
 
-    def write_otf(self,i,l_SAXS,SAXS,fm):
-        self.lambda_otf[:,i-1]=l_SAXS
-        self.SAXS_otf[:,i-1]=fm[0]*SAXS+fm[1]
-        self.fm_otf[:,i-1]=fm
+    def write_otf(self, i, l_SAXS, SAXS, fm):
+        self.lambda_otf[:, i-1] = l_SAXS
+        self.SAXS_otf[:, i-1] = fm[0]*SAXS + fm[1]
+        self.fm_otf[:, i-1] = fm
 
-    def write_angle(self,i,positions,cell):
+    def write_angle(self, i, positions, cell):
         angle=_compute_angle(positions,cell)[0]
         self.angle[:,i-1]=angle
 
     def run(self):
         if self.positions is None:
-            self.cell,self.positions=read_positions(self.inputfile)
+            self.cell, self.positions = read_positions(self.inputfile)
 
-        random=Random(self.idum)
+        random = Random(self.idum)
 
         # masses are hardcoded to 1
-        masses=np.ones(len(self.positions))
+        masses = np.ones(len(self.positions))
 
         # energy integral initialized to 0
-        engint=0.0
+        engint = 0.0
 
         # velocities are randomized according to temperature
-        velocities=self.randomize_velocities(self.temperature,masses,random)
+        velocities = self.randomize_velocities(self.temperature, masses, random)
 
-        # allocate space for neighbor lists
-        nlist=np.zeros(self.maxneighbors*len(self.positions), dtype=int)
-        point=np.zeros(len(self.positions)+1, dtype=int)
+        # allocate space for neighbour lists
+        nlist = np.zeros(self.maxneighbors*len(self.positions), dtype=int)
+        point = np.zeros(len(self.positions) + 1, dtype=int)
         # neighbour list are computed
         _compute_list(self.cell, self.positions, self.listcutoff, nlist, point)
 
-        #print("Neighbour list recomputed at step ",0)
-        #print("List size: ",len(nlist))
+        # print("Neighbour list recomputed at step ",0)
+        # print("List size: ",len(nlist))
 
         # reference positions are saved
-        positions0=+self.positions
+        positions0 = +self.positions  # + required to save variable content and not its reference
 
-        rgyr2=_compute_rgyr2(self.positions,self.cell)[0]
-        SAXS = _compute_SAXS(self.positions, self.cell, self.q_SAXS, self.a_SAXS, self.b_SAXS, self.c_SAXS)[0]
-
-        forces = np.zeros(shape=self.positions.shape)
-
-        #forward models for SAXS
-        fm_SAXS=np.array([1.0, 0.0])
+        # useless?
+        # rgyr2 = _compute_rgyr2(self.positions, self.cell)[0]
+        # saxs = _compute_SAXS(self.positions, self.cell, self.q_SAXS, self.a_SAXS, self.b_SAXS, self.c_SAXS)[0]
         
         # forces are computed before starting md
+        forces = np.zeros(shape=self.positions.shape)
+        engconf = _compute_forces(self.cell, self.positions, self.forcecutoff, nlist, point, forces, self.k_fene,
+                                  self.maxbond, self.k_angle, self.temperature*self.l_rgyr2, self.q_SAXS,
+                                  self.temperature*self.l_SAXS, self.a_SAXS, self.b_SAXS, self.c_SAXS, self.fm_SAXS_0)
 
-        print(forces)
-        engconf = _compute_forces(self.cell, self.positions, self.forcecutoff, nlist, point, forces, self.k_fene, self.maxbond,self.k_angle,self.temperature*self.l_rgyr2,self.q_SAXS,self.temperature*self.l_SAXS,self.a_SAXS,self.b_SAXS,self.c_SAXS, fm_SAXS)
-        print(forces)
-        #sums for ff refinement
-        mean_SAXS=np.zeros(len(self.q_SAXS))
-        mean_g=0.0
-        mean_fg=np.zeros(len(self.q_SAXS))
-        mean_gg=0.0
+        # sums for ff refinement
+        mean_SAXS = np.zeros(len(self.q_SAXS))
+        mean_g = 0.0
+        mean_fg = np.zeros(len(self.q_SAXS))
+        mean_gg = 0.0
 
-        #everage after onthefly evolution
-        l_rgyr2_avg=0.0
-        l_SAXS_avg=np.zeros(len(self.q_SAXS))
-        fm_SAXS_avg=np.array([1.0, 0.0])
-        k_angle_avg=0.0
-        average=False
+        # average after on-the-fly evolution
+        l_rgyr2_avg = 0.0
+        l_SAXS_avg = np.zeros(len(self.q_SAXS))
+        fm_SAXS_avg = self.fm_SAXS_0
+        k_angle_avg = 0.0
+        is_average = False
+        fm_SAXS = +self.fm_SAXS_0
 
-        M = 10000
-        window_w = deque(maxlen=M)
-        window_g = deque(maxlen=M)
-        window_phi = deque(maxlen=M)
-        mean_ff=0
-        var_ff=0
+        window_w = deque(maxlen=self.window_M)
+        window_g = deque(maxlen=self.window_M)
+        window_phi = deque(maxlen=self.window_M)
+        mean_ff = 0
+        var_ff = 0
         
-
-
         # here is the main md loop
         # Langevin thermostat is applied before and after a velocity-Verlet integrator
         # the overall structure is:
@@ -821,62 +840,64 @@ class SimpleMD:
         #   update velocities
         #   update positions
         #   (eventually recompute neighbour list)
+        #   update quantities for on-the-fly refinement (absent if no on-the-fly refinement is performed)
         #   compute forces
         #   update velocities
         #   thermostat
         #   (eventually dump output informations)
 
         for istep in tqdm(range(self.nstep)):
-            if self.friction>0:
-                velocities,engint = self.thermostat(masses,0.5*self.tstep,self.friction,self.temperature,velocities,engint,random)
+            if self.friction > 0:
+                velocities, engint = self.thermostat(masses, 0.5*self.tstep, self.friction, self.temperature,
+                                                     velocities, engint, random)
 
-            velocities+=forces*0.5*self.tstep/masses[:,np.newaxis]
-            self.positions+=velocities*self.tstep
+            velocities += forces*0.5*self.tstep/masses[:, np.newaxis]
+            self.positions += velocities*self.tstep
 
-            check_list=self.check_list(self.positions,positions0,self.listcutoff,self.forcecutoff)
+            check_list = self.check_list(self.positions, positions0, self.listcutoff, self.forcecutoff)
             if check_list:
                 _compute_list(self.cell, self.positions, self.listcutoff, nlist, point)
-                positions0=+self.positions
-                #print("Neighbour list recomputed at step ",istep)
-                #print("List size: ",len(nlist))
+                positions0 = +self.positions
+                # print("Neighbour list recomputed at step ",istep)
+                # print("List size: ",len(nlist))
 
+            # Here lots of quantities are computed, but some of them might be useless in the following.
+            # For example, computing `angle` is useless if force-field fitting is absent, the same for `cov` and `var`
+            # (in this case, `_update_ff` will be called but it will return zero contribution).
+            # The same for `rgyr2` since/when we do not have this experimental observables (we use SAXS).
+            # With SAXS experimental data, `saxs` has always to be computed.
+            rgyr2 = _compute_rgyr2(self.positions, self.cell)[0]
+            saxs = _compute_SAXS(self.positions, self.cell, self.q_SAXS, self.a_SAXS, self.b_SAXS, self.c_SAXS)[0]
+            angle = _compute_angle(self.positions, self.cell)[0]
+            cos = np.sum(np.cos(angle))
+            g = cos
+            mean_SAXS += (saxs - mean_SAXS)/(istep + 1)
+            mean_g += (g - mean_g)/(istep + 1)
+            mean_fg += (saxs*g - mean_fg)/(istep + 1)
+            mean_gg += (g**2 - mean_gg)/(istep + 1)
+            cov = mean_fg - mean_SAXS*mean_g
+            var = mean_gg - mean_g**2
 
-            rgyr2=_compute_rgyr2(self.positions,self.cell)[0]
-            SAXS = _compute_SAXS(self.positions, self.cell, self.q_SAXS, self.a_SAXS, self.b_SAXS, self.c_SAXS)[0]
-            angle=_compute_angle(self.positions,self.cell)[0]
-            cos=np.sum(np.cos(angle))
-            g=cos
-            mean_SAXS+=(SAXS-mean_SAXS)/(istep+1)
-            mean_g+=(g-mean_g)/(istep+1)
-            mean_fg+=(SAXS*g-mean_fg)/(istep+1)
-            mean_gg+=(g**2-mean_gg)/(istep+1)
-            cov=mean_fg-mean_SAXS*mean_g
-            var=mean_gg-mean_g**2
-
-            lw=np.dot(self.l_SAXS , fm_SAXS[0]*SAXS + fm_SAXS[1])
+            lw = np.dot(self.l_SAXS , fm_SAXS[0]*saxs + fm_SAXS[1])
             window_w.append(lw)
             window_g.append(g)
             window_phi.append(self.k_angle)
-            values=np.array(list(window_g))
-            phi=np.array(list(window_phi))
-            logw=np.array(list(window_w))-(1/self.temperature)*(self.k_angle-phi)*values
-            mean_ff, var_ff, p =weighted_mean_var(values, logw)
+            values = np.array(list(window_g))
+            phi = np.array(list(window_phi))
+            logw = np.array(list(window_w)) - (1/self.temperature)*(self.k_angle - phi)*values
+            mean_ff, var_ff, p = weighted_mean_var(values, logw)
 
-
-
-            if istep>self.nequilib+self.nonthefly:
-                
-
-                if not average and self.nonthefly>0:
-                    engint+=self.temperature*np.dot(self.l_SAXS , fm_SAXS[0]*SAXS + fm_SAXS[1])+self.k_angle*cos
-                    self.l_rgyr2=l_rgyr2_avg/(self.nonthefly/2)
-                    self.l_SAXS=l_SAXS_avg/(self.nonthefly/2)
-                    fm_SAXS[0]=fm_SAXS_avg[0]/(self.nonthefly/2)
-                    fm_SAXS[1]=fm_SAXS_avg[1]/(self.nonthefly/2)
-                    self.k_angle=k_angle_avg/(self.nonthefly/2)
-                    engint-=self.temperature*np.dot(self.l_SAXS , fm_SAXS[0]*SAXS + fm_SAXS[1])+self.k_angle*cos
-                    average=True
-                self.SAXS+=fm_SAXS[0]*SAXS+fm_SAXS[1]
+            if istep > (self.nequilib + self.nonthefly):
+                if not is_average and self.nonthefly > 0:
+                    engint += self.temperature*np.dot(self.l_SAXS, fm_SAXS[0]*saxs + fm_SAXS[1]) + self.k_angle*cos
+                    self.l_rgyr2 = l_rgyr2_avg/(self.nonthefly/2)
+                    self.l_SAXS = l_SAXS_avg/(self.nonthefly/2)
+                    fm_SAXS[0] = fm_SAXS_avg[0]/(self.nonthefly/2)
+                    fm_SAXS[1] = fm_SAXS_avg[1]/(self.nonthefly/2)
+                    self.k_angle = k_angle_avg/(self.nonthefly/2)
+                    engint -= self.temperature*np.dot(self.l_SAXS, fm_SAXS[0]*saxs + fm_SAXS[1]) + self.k_angle*cos
+                    is_average = True
+                self.SAXS += fm_SAXS[0]*saxs + fm_SAXS[1]
 
             if (istep > self.nequilib) and (istep <= self.nequilib + self.nonthefly):
                 if self.exp_rgyr2 is not None:
@@ -886,27 +907,33 @@ class SimpleMD:
                     l_rgyr2_avg += self.l_rgyr2
 
                 if self.exp_SAXS is not None:
-                    if self.k_SAXS==0 or self.eta_ff0==0:
-                        engint=_update_parameters(istep, self.tstep, self.temperature, SAXS, self.exp_SAXS, self.sigma_SAXS, self.l_SAXS, fm_SAXS, self.k_SAXS, self.tau_SAXS, self.k_fm, self.tau_fm, engint,self.alpha,self.gamma)
-                        self.k_angle, engint=_update_ff(istep, self.tstep, self.temperature, SAXS, self.exp_SAXS, self.sigma_SAXS, cov, var, angle, self.k_angle, self.eta_ff0, self.tau_ff, engint,self.beta)
+                    if self.k_SAXS == 0 or self.eta_ff0 == 0:  # either, refinement of the ensemble or the force field
+                        engint = _update_parameters(istep, self.tstep, self.temperature, saxs, self.exp_SAXS,
+                                                    self.sigma_SAXS, self.l_SAXS, fm_SAXS, self.k_SAXS, self.tau_SAXS,
+                                                    self.k_fm, self.tau_fm, engint, self.alpha, self.gamma)
+                        self.k_angle, engint = _update_ff(istep, self.tstep, self.temperature, saxs, self.exp_SAXS,
+                                                          self.sigma_SAXS, cov, var, angle, self.k_angle, self.eta_ff0,
+                                                          self.tau_ff, engint, self.beta)
                     else:
-                        self.k_angle, engint=_update_full(istep, self.tstep, self.temperature, SAXS, self.exp_SAXS, self.sigma_SAXS, self.l_SAXS, fm_SAXS, self.k_SAXS, self.tau_SAXS, self.k_fm, self.tau_fm, mean_ff, var_ff, angle, self.k_angle, self.eta_ff0, self.tau_ff,engint,self.nequilib+self.nonthefly/4,self.alpha,self.beta,self.gamma)
-                    if istep>self.nequilib+self.nonthefly/2:
-                        l_SAXS_avg+=self.l_SAXS
-                        fm_SAXS_avg+=fm_SAXS
-                        k_angle_avg+=self.k_angle
-                    
-                    
+                        self.k_angle, engint = _update_full(istep, self.tstep, self.temperature, saxs, self.exp_SAXS,
+                                                            self.sigma_SAXS, self.l_SAXS, fm_SAXS, self.k_SAXS, self.tau_SAXS,
+                                                            self.k_fm, self.tau_fm, mean_ff, var_ff, angle, self.k_angle,
+                                                            self.eta_ff0, self.tau_ff, engint, self.nequilib + self.nonthefly/4,
+                                                            self.alpha, self.beta, self.gamma)
+                    if istep > self.nequilib + self.nonthefly/2:
+                        l_SAXS_avg += self.l_SAXS
+                        fm_SAXS_avg += fm_SAXS
+                        k_angle_avg += self.k_angle
 
-           
+            engconf = _compute_forces(self.cell, self.positions, self.forcecutoff, nlist, point, forces, self.k_fene,
+                                      self.maxbond, self.k_angle, self.temperature*self.l_rgyr2, self.q_SAXS,
+                                      self.temperature*self.l_SAXS, self.a_SAXS, self.b_SAXS, self.c_SAXS, fm_SAXS)
 
-            engconf=_compute_forces(self.cell, self.positions, self.forcecutoff, nlist, point, forces, self.k_fene, self.maxbond,self.k_angle, self.temperature*self.l_rgyr2,self.q_SAXS,self.temperature*self.l_SAXS,self.a_SAXS,self.b_SAXS,self.c_SAXS, fm_SAXS)
-
-            velocities+=forces*0.5*self.tstep/masses[:,np.newaxis]
+            velocities += forces*0.5*self.tstep/masses[:, np.newaxis]
 
             if self.friction > 0.0:
-                velocities, engint = self.thermostat(masses, 0.5*self.tstep, self.friction, self.temperature, velocities,
-                                                     engint, random)
+                velocities, engint = self.thermostat(masses, 0.5*self.tstep, self.friction, self.temperature,
+                                                     velocities, engint, random)
 
             if ((istep + 1) % self.nconfig) == 0:
                 self.write_positions(self.cell, self.positions, self.wrapatoms)
@@ -917,24 +944,21 @@ class SimpleMD:
                 self.write_statistics(istep + 1, self.tstep, len(self.positions), engkin, engconf, engint, rgyr2, 
                                       self.l_rgyr2, self.k_angle, mean_ff, logw[0])
                 
-                self.write_otf((istep + 1)//self.nstat, self.l_SAXS, SAXS, fm_SAXS)
+                self.write_otf((istep + 1)//self.nstat, self.l_SAXS, saxs, fm_SAXS)
                 
                 if self.exp_SAXS is not None:
-                    ## alpha=1.0  # ??
-                    grad_lambda = self.exp_SAXS - (fm_SAXS[0]*SAXS + fm_SAXS[1]) + self.alpha * (self.sigma_SAXS**2) * self.l_SAXS
+                    grad_lambda = self.exp_SAXS - (fm_SAXS[0]*saxs + fm_SAXS[1]) + self.alpha*(self.sigma_SAXS**2)*self.l_SAXS
                     self.grad_lambda[:, (istep + 1)//self.nstat - 1] = grad_lambda
 
                 self.write_angle((istep + 1)//self.nstat, self.positions, self.cell)
 
-    
-
         self.write_final_positions(self.cell, self.positions, self.wrapatoms)
-        self.SAXS /= self.nstep - self.nequilib - self.nonthefly
 
-        print('fm_SAXS: ', fm_SAXS)
-        print('l_SAXS: ', self.l_SAXS[0])
+        self.SAXS /= self.nstep - self.nequilib - self.nonthefly  # compute the average value
+
+        # print('fm_SAXS: ', fm_SAXS)
+        # print('l_SAXS: ', self.l_SAXS[0])
         
-
         if self.write_statistics_fp is not None:
             self.write_statistics_fp.close()
 
