@@ -310,6 +310,7 @@ def _compute_forces(cell, positions, forcecutoff, neighbors, point, forces, k_fe
         forces += l_rgyr2*rgyr2_forces
 
     # SAXS
+    # if not l_SAXS[q] == 0 for every q:
     saxs, saxs_forces_dict = _compute_SAXS(positions, cell, q_SAXS, a_SAXS, b_SAXS, c_SAXS, True)
 
     for q in range(len(q_SAXS)):
@@ -323,10 +324,11 @@ def _compute_forces(cell, positions, forcecutoff, neighbors, point, forces, k_fe
 
 @numba.njit(cache=True, fastmath=True)
 def _update_parameters(istep, tstep, temperature, SAXS, exp_SAXS, sigma_SAXS, lambda_SAXS, fm, eta_lambda0, tau_lambda,
-                       eta_theta0, tau_theta, engint, alpha, beta):
+                       eta_theta0, tau_theta, engint, alpha, gamma, grad_fm_reg_fun):
     """
     Update the learning rates and the parameters (lambda coefficients, forward-model coefficients, output of the forward
-    model and interaction energy).
+    model and interaction energy). This function acts for simultaneous refinement of ensembles and forward models (not
+    for force-field fitting).
 
     Parameters
     ----------
@@ -350,8 +352,12 @@ def _update_parameters(istep, tstep, temperature, SAXS, exp_SAXS, sigma_SAXS, la
     engint: float
         The interaction energy.
     
-    alpha, beta: float
+    alpha, gamma: float
         The hyperparameters for the regularization of ensemble refinement and forward-model refinement.
+
+    grad_fm_reg_fun : function
+        Function to compute the gradient of the regularization to the forward model
+        (the result will then be multiplied by the hyperparameter `gamma`).
 
     Notes
     -----
@@ -364,8 +370,9 @@ def _update_parameters(istep, tstep, temperature, SAXS, exp_SAXS, sigma_SAXS, la
 
     # gradients
     grad_lambda = exp_SAXS - fm_SAXS + alpha * (sigma_SAXS**2) * lambda_SAXS
-    grad_a = alpha*np.dot(lambda_SAXS, SAXS) + beta/fm[0]
-    grad_b = alpha*np.sum(lambda_SAXS)
+    grad_fm_reg = gamma*grad_fm_reg_fun(fm)
+    grad_a = alpha*np.dot(lambda_SAXS, SAXS) + grad_fm_reg[0]
+    grad_b = alpha*np.sum(lambda_SAXS) + grad_fm_reg[1]
 
     # learning rates
     eta_lambda = eta_lambda0 / (1 + istep / tau_lambda)
@@ -404,7 +411,7 @@ def _update_ff(istep, tstep, temperature, SAXS, exp_SAXS, sigma_SAXS, cov, var, 
 
 @numba.njit(cache=True, fastmath=True)
 def _update_full(istep, tstep, temperature, SAXS, exp_SAXS, sigma_SAXS, lambda_SAXS, fm, k_l, tau_l, k_fm, tau_fm,
-                 mean_ff, var_ff, angle, k_angle, k_ff, tau_ff, engint, delay, alpha, beta, gamma):
+                 mean_ff, var_ff, angle, k_angle, k_ff, tau_ff, engint, delay, alpha, beta, gamma, grad_fm_reg_fun):
     """
     Update parameters in the case of simultaneous refinement on the ensemble and the force field.
 
@@ -420,7 +427,7 @@ def _update_full(istep, tstep, temperature, SAXS, exp_SAXS, sigma_SAXS, lambda_S
     """
 
     engint = _update_parameters(istep, tstep, temperature, SAXS, exp_SAXS, sigma_SAXS, lambda_SAXS, fm, k_l, tau_l,
-                                k_fm, tau_fm, engint, alpha, gamma)
+                                k_fm, tau_fm, engint, alpha, gamma, grad_fm_reg_fun)
 
     engint += k_angle*np.sum(np.cos(angle))
 
@@ -543,6 +550,14 @@ def write_trajectory(file, trajectory, *, wrapatoms=False):
                 positions = pbc(cell,positions)
             np.savetxt(f,positions,fmt="Ar %10.7f %10.7f %10.7f")
 
+@numba.njit(cache=True, fastmath=True)
+def _grad_fm_reg_fun_default(fm):
+    return np.array([1/fm[0], 0])
+
+@numba.njit(cache=True, fastmath=True)
+def _grad_fm_reg_fun_l2(fm):
+    return fm
+
 #%% class SimpleMD
 
 class SimpleMD:
@@ -572,6 +587,7 @@ class SimpleMD:
                 alpha=1.0,
                 beta=1.0,
                 gamma=1.0,
+                grad_fm_reg_fun='l2',
                 sigma_SAXS=None,
                 fm_SAXS_0 = np.array([1.0, 0.0]),
                 k_fm=[0.0,0.0],
@@ -636,6 +652,13 @@ class SimpleMD:
         self.alpha=alpha
         self.beta=beta
         self.gamma=gamma
+
+        if grad_fm_reg_fun == 'default': grad_fm_reg_fun = _grad_fm_reg_fun_default  # lambda fm: np.array([1/fm[0], 0])
+        elif grad_fm_reg_fun == 'l2': grad_fm_reg_fun = _grad_fm_reg_fun_l2  # lambda fm: fm
+        else: assert callable(grad_fm_reg_fun), 'expected a numba-compiled function'
+        self.grad_fm_reg_fun = grad_fm_reg_fun
+        " customizable function for the gradient of the forward-model regularization "
+
         if sigma_SAXS is None:
             self.sigma_SAXS=np.zeros(len(self.q_SAXS))
         else:
@@ -910,7 +933,7 @@ class SimpleMD:
                     if self.k_SAXS == 0 or self.eta_ff0 == 0:  # either, refinement of the ensemble or the force field
                         engint = _update_parameters(istep, self.tstep, self.temperature, saxs, self.exp_SAXS,
                                                     self.sigma_SAXS, self.l_SAXS, fm_SAXS, self.k_SAXS, self.tau_SAXS,
-                                                    self.k_fm, self.tau_fm, engint, self.alpha, self.gamma)
+                                                    self.k_fm, self.tau_fm, engint, self.alpha, self.gamma, self.grad_fm_reg_fun)
                         self.k_angle, engint = _update_ff(istep, self.tstep, self.temperature, saxs, self.exp_SAXS,
                                                           self.sigma_SAXS, cov, var, angle, self.k_angle, self.eta_ff0,
                                                           self.tau_ff, engint, self.beta)
@@ -919,7 +942,7 @@ class SimpleMD:
                                                             self.sigma_SAXS, self.l_SAXS, fm_SAXS, self.k_SAXS, self.tau_SAXS,
                                                             self.k_fm, self.tau_fm, mean_ff, var_ff, angle, self.k_angle,
                                                             self.eta_ff0, self.tau_ff, engint, self.nequilib + self.nonthefly/4,
-                                                            self.alpha, self.beta, self.gamma)
+                                                            self.alpha, self.beta, self.gamma, self.grad_fm_reg_fun)
                     if istep > self.nequilib + self.nonthefly/2:
                         l_SAXS_avg += self.l_SAXS
                         fm_SAXS_avg += fm_SAXS
